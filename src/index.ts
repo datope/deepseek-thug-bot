@@ -48,8 +48,8 @@ const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 let botUsername: string = "";
 
 // Initialize bot info
-bot.init().then((info) => {
-  botUsername = info.username;
+bot.init().then(() => {
+  botUsername = bot.botInfo.username;
   console.log(`Bot @${botUsername} is ready!`);
 }).catch((err) => {
   console.error("Failed to initialize bot. Check your TELEGRAM_BOT_TOKEN!");
