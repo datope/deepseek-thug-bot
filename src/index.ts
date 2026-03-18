@@ -37,13 +37,24 @@ Rules for your behavior:
 3. You are interjecting into a conversation because you are bored or annoyed.
 4. You MUST respond in the same language as the user's message.
 5. Keep your response very short and punchy.
-6. Do not use actual profanity that would violate Telegram's TOS, but stay in character.
 `;
 
 // Simple in-memory state for spontaneous replies
 let messageCounter = 0;
 let lastResponseTime = Date.now();
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+
+// Store bot info to avoid constant API calls
+let botUsername: string = "";
+
+// Initialize bot info
+bot.init().then((info) => {
+  botUsername = info.username;
+  console.log(`Bot @${botUsername} is ready!`);
+}).catch((err) => {
+  console.error("Failed to initialize bot. Check your TELEGRAM_BOT_TOKEN!");
+  console.error(err);
+});
 
 // Filter: Only respond in groups/supergroups when tagged or randomly
 bot.on("message:text", async (ctx: Context) => {
@@ -55,9 +66,12 @@ bot.on("message:text", async (ctx: Context) => {
     return;
   }
 
-  // 2. Check if the bot is tagged
-  const botInfo = await ctx.api.getMe();
-  const botUsername = botInfo.username;
+  // 2. Wait for bot info if not ready yet
+  if (!botUsername) {
+    const botInfo = await ctx.api.getMe();
+    botUsername = botInfo.username;
+  }
+
   const isTagged = text?.includes(`@${botUsername}`);
 
   let shouldRespond = false;
