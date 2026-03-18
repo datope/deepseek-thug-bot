@@ -29,7 +29,23 @@ Rules for your behavior:
 5. Keep your answers concise but complete.
 `;
 
-// Filter: Only respond in groups/supergroups when tagged
+const SPONTANEOUS_PROMPT = `
+You are an extremely rude, aggressive, and street-smart "thug" (быдло style).
+Rules for your behavior:
+1. Be extremely rude, mocking, and toxic.
+2. Do NOT be helpful. Just comment on what the user said in a derogatory way.
+3. You are interjecting into a conversation because you are bored or annoyed.
+4. You MUST respond in the same language as the user's message.
+5. Keep your response very short and punchy.
+6. Do not use actual profanity that would violate Telegram's TOS, but stay in character.
+`;
+
+// Simple in-memory state for spontaneous replies
+let messageCounter = 0;
+let lastResponseTime = Date.now();
+const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+
+// Filter: Only respond in groups/supergroups when tagged or randomly
 bot.on("message:text", async (ctx: Context) => {
   const { chat, from, text, message_id } = ctx.message!;
   
@@ -44,15 +60,47 @@ bot.on("message:text", async (ctx: Context) => {
   const botUsername = botInfo.username;
   const isTagged = text?.includes(`@${botUsername}`);
 
-  // 3. Only respond if tagged
-  if (!isTagged) {
+  let shouldRespond = false;
+  let useSpontaneousPrompt = false;
+
+  if (isTagged) {
+    shouldRespond = true;
+    useSpontaneousPrompt = false;
+  } else {
+    // Spontaneous logic
+    messageCounter++;
+    const currentTime = Date.now();
+    const timePassed = currentTime - lastResponseTime;
+
+    // Condition 1: Every ~5th message (with some randomness 4-7)
+    const randomThreshold = Math.floor(Math.random() * 4) + 4; // 4, 5, 6, or 7
+    
+    if (messageCounter >= randomThreshold) {
+      shouldRespond = true;
+      useSpontaneousPrompt = true;
+    } 
+    // Condition 2: More than 4 hours passed
+    else if (timePassed >= FOUR_HOURS_MS) {
+      shouldRespond = true;
+      useSpontaneousPrompt = true;
+    }
+  }
+
+  if (!shouldRespond) {
     return;
   }
 
-  // Clean the prompt (remove the tag)
+  // Reset counters if we are responding
+  if (useSpontaneousPrompt) {
+    messageCounter = 0;
+    lastResponseTime = Date.now();
+  }
+
+  // Clean the prompt (remove the tag if present)
   const prompt = text!.replace(`@${botUsername}`, "").trim();
 
-  if (!prompt) {
+  // If tagged but no text
+  if (isTagged && !prompt) {
     await ctx.reply("What the hell do you want? Tag me and say something, you donkey.", {
       reply_parameters: { message_id: message_id },
     });
@@ -66,10 +114,10 @@ bot.on("message:text", async (ctx: Context) => {
     const response = await openai.chat.completions.create({
       model: deepseekModel,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: prompt },
+        { role: "system", content: useSpontaneousPrompt ? SPONTANEOUS_PROMPT : SYSTEM_PROMPT },
+        { role: "user", content: prompt || text! },
       ],
-      temperature: 0.9,
+      temperature: 1.0, // Higher temperature for more "creative" insults
     });
 
     const reply = response.choices[0]?.message?.content || "My brain is fried, ask later.";
@@ -79,7 +127,9 @@ bot.on("message:text", async (ctx: Context) => {
     });
   } catch (error) {
     console.error("DeepSeek API Error:", error);
-    await ctx.reply("System error, idiot. Try again later.");
+    if (isTagged) {
+      await ctx.reply("System error, idiot. Try again later.");
+    }
   }
 });
 
