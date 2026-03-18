@@ -8,6 +8,9 @@ const botToken = process.env.TELEGRAM_BOT_TOKEN;
 const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
 const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-chat";
 const isDebugEnabled = process.env.DEBUG === "1";
+const startupChat = process.env.STARTUP_CHAT; // e.g. "@deepseekV4_chat"
+const startupText = process.env.STARTUP_TEXT; // e.g. "привет"
+const shouldExitAfterStartupSend = process.env.STARTUP_EXIT_AFTER_SEND === "1";
 
 if (!botToken || !deepseekApiKey) {
   console.error("Missing environment variables. Check your .env file.");
@@ -79,6 +82,7 @@ const chatStateByChatId = new Map<string, ChatState>();
 
 // Store bot info to avoid constant API calls
 let botUsernameLower: string | null = null;
+let botId: number | null = null;
 
 bot.command("ping", async (ctx) => {
   if (ctx.chat?.type === "private") return;
@@ -111,11 +115,12 @@ bot.on("message:text", async (ctx: Context) => {
 
   const textLower = (text ?? "").toLowerCase();
   const isTagged = botUsernameLower ? textLower.includes(`@${botUsernameLower}`) : false;
+  const isReplyToBot = ctx.message?.reply_to_message?.from?.id === botId;
 
   let shouldRespond = false;
   let useSpontaneousPrompt = false;
 
-  if (isTagged) {
+  if (isTagged || isReplyToBot) {
     shouldRespond = true;
     useSpontaneousPrompt = false;
   } else {
@@ -184,7 +189,7 @@ bot.on("message:text", async (ctx: Context) => {
     });
   } catch (error) {
     console.error("DeepSeek API Error:", error);
-    if (isTagged) {
+    if (isTagged || isReplyToBot) {
       await ctx.reply("System error, idiot. Try again later.");
     }
   }
@@ -204,9 +209,18 @@ bot.catch((err) => {
 async function start() {
   await bot.init();
   const username = bot.botInfo.username;
+  botId = bot.botInfo.id;
   if (!username) throw new Error("Bot username is missing after init()");
   botUsernameLower = username.toLowerCase();
   console.log(`Bot @${username} is ready!`);
+
+  if (startupChat && startupText) {
+    console.log(`Sending startup message to ${startupChat}...`);
+    await bot.api.sendMessage(startupChat, startupText);
+    console.log("Startup message sent.");
+    if (shouldExitAfterStartupSend) return;
+  }
+
   bot.start();
 }
 
