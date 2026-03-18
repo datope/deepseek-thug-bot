@@ -55,6 +55,7 @@ interface ChatState {
   messageCounter: number;
   nextInterjectionAt: number;
   lastSeenMessageAt: number;
+  history: Array<{ role: "user" | "assistant"; content: string }>;
 }
 
 function randomIntInclusive(min: number, max: number) {
@@ -73,6 +74,7 @@ function getOrCreateChatState(chatId: number | string, now: number) {
     messageCounter: 0,
     nextInterjectionAt: randomIntInclusive(4, 7),
     lastSeenMessageAt: now,
+    history: [],
   };
   chatStateByChatId.set(key, created);
   return created;
@@ -173,16 +175,31 @@ bot.on("message:text", async (ctx: Context) => {
     // Typing indicator
     await ctx.replyWithChatAction("typing");
 
+    // Context management
+    const currentMessageContent = prompt || text!;
+    chatState.history.push({ role: "user", content: currentMessageContent });
+
+    // Keep only last 3 messages in history
+    if (chatState.history.length > 3) {
+      chatState.history.shift();
+    }
+
     const response = await openai.chat.completions.create({
       model: deepseekModel,
       messages: [
         { role: "system", content: useSpontaneousPrompt ? SPONTANEOUS_PROMPT : SYSTEM_PROMPT },
-        { role: "user", content: prompt || text! },
+        ...chatState.history,
       ],
       temperature: useSpontaneousPrompt ? 1.0 : 0.7,
     });
 
     const reply = response.choices[0]?.message?.content || "My brain is fried, ask later.";
+
+    // Add assistant reply to history
+    chatState.history.push({ role: "assistant", content: reply });
+    if (chatState.history.length > 3) {
+      chatState.history.shift();
+    }
 
     await ctx.reply(reply, {
       reply_parameters: { message_id: message_id },
