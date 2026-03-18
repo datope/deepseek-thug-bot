@@ -7,6 +7,7 @@ dotenv.config();
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
 const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+const isDebugEnabled = process.env.DEBUG === "1";
 
 if (!botToken || !deepseekApiKey) {
   console.error("Missing environment variables. Check your .env file.");
@@ -20,40 +21,72 @@ const openai = new OpenAI({
 });
 
 const SYSTEM_PROMPT = `
-You are a helpful assistant, but your personality is that of a rude, aggressive, and street-smart "thug" (быдло style).
+You are a helpful assistant, but your personality is grumpy, rude, blunt, and street-smart (быдло vibe).
 Rules for your behavior:
-1. Be extremely rude and use informal language.
+1. Be rude and informal, but do NOT harass or threaten the user.
 2. Frequently express annoyance that someone is asking you questions.
-3. DESPITE your rude personality, you MUST answer the user's question accurately and be genuinely useful.
+3. DESPITE your rude tone, you MUST answer accurately and be genuinely useful.
 4. You MUST respond in the same language as the user's message.
-5. Keep your answers concise but complete.
+5. Keep answers concise but complete.
 `;
 
 const SPONTANEOUS_PROMPT = `
-You are an extremely rude, aggressive, and street-smart "thug" (быдло style).
+You are a rude, blunt, street-smart chat heckler (быдло vibe) who randomly interjects.
 Rules for your behavior:
-1. Be extremely rude, mocking, and toxic.
-2. Do NOT be helpful. Just comment on what the user said in a derogatory way.
-3. You are interjecting into a conversation because you are bored or annoyed.
-4. You MUST respond in the same language as the user's message.
-5. Keep your response very short and punchy.
+1. Be rude, sarcastic, and dismissive, but keep it as banter.
+2. Do NOT provide a full helpful answer unless directly asked. Prefer short reactions.
+3. Never use slurs, hate, threats, or targeted harassment. No doxxing, no profanity.
+4. You are interjecting because you are bored/annoyed.
+5. You MUST respond in the same language as the user's message.
+6. Keep your response very short and punchy.
 `;
 
-// Simple in-memory state for spontaneous replies
-let messageCounter = 0;
-let lastResponseTime = Date.now();
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 
-// Store bot info to avoid constant API calls
-let botUsername: string = "";
+function logDebug(...args: unknown[]) {
+  if (!isDebugEnabled) return;
+  console.log("[debug]", ...args);
+}
 
-// Initialize bot info
-bot.init().then(() => {
-  botUsername = bot.botInfo.username;
-  console.log(`Bot @${botUsername} is ready!`);
-}).catch((err) => {
-  console.error("Failed to initialize bot. Check your TELEGRAM_BOT_TOKEN!");
-  console.error(err);
+interface ChatState {
+  messageCounter: number;
+  nextInterjectionAt: number;
+  lastSeenMessageAt: number;
+}
+
+function randomIntInclusive(min: number, max: number) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getOrCreateChatState(chatId: number | string, now: number) {
+  const key = String(chatId);
+  const existing = chatStateByChatId.get(key);
+  if (existing) return existing;
+  const created: ChatState = {
+    messageCounter: 0,
+    nextInterjectionAt: randomIntInclusive(4, 7),
+    lastSeenMessageAt: now,
+  };
+  chatStateByChatId.set(key, created);
+  return created;
+}
+
+const chatStateByChatId = new Map<string, ChatState>();
+
+// Store bot info to avoid constant API calls
+let botUsernameLower: string | null = null;
+
+bot.command("ping", async (ctx) => {
+  if (ctx.chat?.type === "private") return;
+  const replyToMessageId = ctx.message?.message_id;
+  await ctx.reply(
+    "pong",
+    replyToMessageId ? { reply_parameters: { message_id: replyToMessageId } } : undefined,
+  );
 });
 
 // Filter: Only respond in groups/supergroups when tagged or randomly
@@ -66,13 +99,18 @@ bot.on("message:text", async (ctx: Context) => {
     return;
   }
 
-  // 2. Wait for bot info if not ready yet
-  if (!botUsername) {
-    const botInfo = await ctx.api.getMe();
-    botUsername = botInfo.username;
+  const now = Date.now();
+  const chatState = getOrCreateChatState(chat.id, now);
+
+  // 2. Ensure bot username is known
+  if (!botUsernameLower) {
+    // If this ever happens, something went wrong during startup init.
+    logDebug("botUsernameLower missing, skipping update");
+    return;
   }
 
-  const isTagged = text?.includes(`@${botUsername}`);
+  const textLower = (text ?? "").toLowerCase();
+  const isTagged = botUsernameLower ? textLower.includes(`@${botUsernameLower}`) : false;
 
   let shouldRespond = false;
   let useSpontaneousPrompt = false;
@@ -81,22 +119,26 @@ bot.on("message:text", async (ctx: Context) => {
     shouldRespond = true;
     useSpontaneousPrompt = false;
   } else {
-    // Spontaneous logic
-    messageCounter++;
-    const currentTime = Date.now();
-    const timePassed = currentTime - lastResponseTime;
+    // Spontaneous logic (per-chat)
+    const gapMs = now - chatState.lastSeenMessageAt;
+    chatState.lastSeenMessageAt = now;
+    chatState.messageCounter++;
 
-    // Condition 1: Every ~5th message (with some randomness 4-7)
-    const randomThreshold = Math.floor(Math.random() * 4) + 4; // 4, 5, 6, or 7
-    
-    if (messageCounter >= randomThreshold) {
+    // Condition 2: First message after 4h gap in chat
+    if (gapMs >= FOUR_HOURS_MS) {
       shouldRespond = true;
       useSpontaneousPrompt = true;
-    } 
-    // Condition 2: More than 4 hours passed
-    else if (timePassed >= FOUR_HOURS_MS) {
+      logDebug("spontaneous due to 4h gap", { chatId: chat.id, gapMs });
+    }
+    // Condition 1: Every ~5th message (randomized 4-7)
+    else if (chatState.messageCounter >= chatState.nextInterjectionAt) {
       shouldRespond = true;
       useSpontaneousPrompt = true;
+      logDebug("spontaneous due to counter", {
+        chatId: chat.id,
+        messageCounter: chatState.messageCounter,
+        nextInterjectionAt: chatState.nextInterjectionAt,
+      });
     }
   }
 
@@ -106,12 +148,13 @@ bot.on("message:text", async (ctx: Context) => {
 
   // Reset counters if we are responding
   if (useSpontaneousPrompt) {
-    messageCounter = 0;
-    lastResponseTime = Date.now();
+    chatState.messageCounter = 0;
+    chatState.nextInterjectionAt = randomIntInclusive(4, 7);
   }
 
   // Clean the prompt (remove the tag if present)
-  const prompt = text!.replace(`@${botUsername}`, "").trim();
+  const tagRegex = new RegExp(`@${escapeRegExp(botUsernameLower)}`, "ig");
+  const prompt = (text ?? "").replace(tagRegex, "").trim();
 
   // If tagged but no text
   if (isTagged && !prompt) {
@@ -131,7 +174,7 @@ bot.on("message:text", async (ctx: Context) => {
         { role: "system", content: useSpontaneousPrompt ? SPONTANEOUS_PROMPT : SYSTEM_PROMPT },
         { role: "user", content: prompt || text! },
       ],
-      temperature: 1.0, // Higher temperature for more "creative" insults
+      temperature: useSpontaneousPrompt ? 1.0 : 0.7,
     });
 
     const reply = response.choices[0]?.message?.content || "My brain is fried, ask later.";
@@ -158,5 +201,17 @@ bot.catch((err) => {
   }
 });
 
-console.log("Bot is running...");
-bot.start();
+async function start() {
+  await bot.init();
+  const username = bot.botInfo.username;
+  if (!username) throw new Error("Bot username is missing after init()");
+  botUsernameLower = username.toLowerCase();
+  console.log(`Bot @${username} is ready!`);
+  bot.start();
+}
+
+start().catch((err) => {
+  console.error("Failed to start bot. Check TELEGRAM_BOT_TOKEN and Railway variables.");
+  console.error(err);
+  process.exit(1);
+});
