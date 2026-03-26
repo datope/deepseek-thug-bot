@@ -241,6 +241,10 @@ async function start() {
   bot.start();
 }
 
+// Graceful shutdown
+process.once("SIGINT", () => bot.stop());
+process.once("SIGTERM", () => bot.stop());
+
 start().catch((err) => {
   console.error("Failed to start bot. Check TELEGRAM_BOT_TOKEN and Railway variables.");
   console.error(err);
