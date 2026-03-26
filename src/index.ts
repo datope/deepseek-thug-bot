@@ -1,4 +1,5 @@
-import { Bot, Context } from "grammy";
+import { createServer, type Server } from "node:http";
+import { Bot, Context, webhookCallback } from "grammy";
 import OpenAI from "openai";
 import dotenv from "dotenv";
 
@@ -11,6 +12,20 @@ const isDebugEnabled = process.env.DEBUG === "1";
 const startupChat = process.env.STARTUP_CHAT; // e.g. "@deepseekV4_chat"
 const startupText = process.env.STARTUP_TEXT; // e.g. "привет"
 const shouldExitAfterStartupSend = process.env.STARTUP_EXIT_AFTER_SEND === "1";
+
+function shouldUseWebhook(): boolean {
+  if (process.env.USE_POLLING === "1") return false;
+  if (process.env.USE_WEBHOOK === "1") return true;
+  return Boolean(process.env.RAILWAY_PUBLIC_DOMAIN);
+}
+
+function getWebhookBaseUrl(): string | null {
+  const explicit = process.env.WEBHOOK_BASE_URL?.replace(/\/$/, "");
+  if (explicit) return explicit;
+  const host = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (host) return `https://${host}`;
+  return null;
+}
 
 if (!botToken || !deepseekApiKey) {
   console.error("Missing environment variables. Check your .env file.");
@@ -85,6 +100,7 @@ const chatStateByChatId = new Map<string, ChatState>();
 // Store bot info to avoid constant API calls
 let botUsernameLower: string | null = null;
 let botId: number | null = null;
+let httpServer: Server | null = null;
 
 bot.command("ping", async (ctx) => {
   if (ctx.chat?.type === "private") return;
@@ -238,12 +254,68 @@ async function start() {
     if (shouldExitAfterStartupSend) return;
   }
 
-  bot.start();
+  const useWebhook = shouldUseWebhook();
+  const baseUrl = getWebhookBaseUrl();
+  const webhookPath = process.env.WEBHOOK_PATH ?? "/telegram/webhook";
+  const port = Number(process.env.PORT ?? "3000");
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+
+  if (useWebhook) {
+    if (!baseUrl) {
+      throw new Error("Webhook mode needs WEBHOOK_BASE_URL or RAILWAY_PUBLIC_DOMAIN");
+    }
+    const webhookUrl = `${baseUrl}${webhookPath}`;
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+    await bot.api.setWebhook(webhookUrl, {
+      drop_pending_updates: true,
+      ...(webhookSecret ? { secret_token: webhookSecret } : {}),
+    });
+    console.log(`Webhook mode: ${webhookUrl}`);
+
+    const handleUpdate = webhookCallback(bot, "http", {
+      ...(webhookSecret ? { secretToken: webhookSecret } : {}),
+    });
+
+    httpServer = createServer((req, res) => {
+      const pathOnly = (req.url ?? "/").split("?")[0] ?? "/";
+      if (req.method === "POST" && pathOnly === webhookPath) {
+        void handleUpdate(req, res);
+        return;
+      }
+      if (req.method === "GET" && (pathOnly === "/" || pathOnly === "/health")) {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    httpServer.listen(port, () => {
+      console.log(`HTTP listening on port ${port}`);
+    });
+    return;
+  }
+
+  if (process.env.DELETE_WEBHOOK_BEFORE_POLLING === "1") {
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+    console.log("deleteWebhook: cleared (DELETE_WEBHOOK_BEFORE_POLLING=1)");
+  }
+  console.log("Long polling (getUpdates). If you see 409, another process is also polling this token.");
+  await bot.start();
 }
 
-// Graceful shutdown
-process.once("SIGINT", () => bot.stop());
-process.once("SIGTERM", () => bot.stop());
+async function shutdown() {
+  try {
+    await bot.stop();
+  } catch {
+    /* bot.start() was never called in webhook mode */
+  }
+  httpServer?.close();
+}
+
+process.once("SIGINT", () => void shutdown());
+process.once("SIGTERM", () => void shutdown());
 
 start().catch((err) => {
   console.error("Failed to start bot. Check TELEGRAM_BOT_TOKEN and Railway variables.");
