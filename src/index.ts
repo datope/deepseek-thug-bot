@@ -1,13 +1,15 @@
 import { createServer, type Server } from "node:http";
-import { Bot, Context, webhookCallback } from "grammy";
+import { Bot, webhookCallback } from "grammy";
+import type { Message } from "grammy/types";
 import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
-const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash-vision-exp";
 const isDebugEnabled = process.env.DEBUG === "1";
 const startupChat = process.env.STARTUP_CHAT; // e.g. "@deepseekV4_chat"
 const startupText = process.env.STARTUP_TEXT; // e.g. "привет"
@@ -81,6 +83,53 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function mimeFromFilePath(filePath: string, fallback = "image/jpeg"): string {
+  const ext = filePath.split(".").pop()?.toLowerCase();
+  switch (ext) {
+    case "png":
+      return "image/png";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    default:
+      return fallback;
+  }
+}
+
+function getImageSource(message?: Message): { fileId: string; mimeHint: string } | null {
+  if (!message) return null;
+  if (message.photo?.length) {
+    const largest = message.photo[message.photo.length - 1];
+    if (!largest) return null;
+    return { fileId: largest.file_id, mimeHint: "image/jpeg" };
+  }
+  const document = message.document;
+  const mime = document?.mime_type;
+  if (document && mime?.startsWith("image/")) {
+    return { fileId: document.file_id, mimeHint: mime };
+  }
+  return null;
+}
+
+async function downloadTelegramImage(fileId: string, mimeHint: string) {
+  const file = await bot.api.getFile(fileId);
+  if (!file.file_path) return null;
+  const url = `https://api.telegram.org/file/bot${botToken}/${file.file_path}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Telegram file download failed: ${res.status}`);
+  }
+  const base64 = Buffer.from(await res.arrayBuffer()).toString("base64");
+  return {
+    base64,
+    mime: mimeFromFilePath(file.file_path, mimeHint),
+  };
+}
+
 function getOrCreateChatState(chatId: number | string, now: number) {
   const key = String(chatId);
   const existing = chatStateByChatId.get(key);
@@ -111,11 +160,19 @@ bot.command("ping", async (ctx) => {
   );
 });
 
-// Filter: Only respond in groups/supergroups when tagged or randomly
-bot.on("message:text", async (ctx: Context) => {
-  const { chat, from, text, message_id } = ctx.message!;
-  
-  // 1. Ignore private chats (DMs)
+// Groups/supergroups: respond when tagged, replied to, or randomly
+bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
+  const message = ctx.message;
+  if (!message) return;
+
+  const { chat, from, message_id } = message;
+  const text = message.text ?? message.caption ?? "";
+  const ownImage = getImageSource(message);
+  const repliedImage = getImageSource(message.reply_to_message);
+  const imageSource = ownImage ?? repliedImage;
+
+  if (message.document && !ownImage) return;
+
   if (chat.type === "private") {
     console.log("Ignoring message in DM from", from?.first_name);
     return;
@@ -124,16 +181,14 @@ bot.on("message:text", async (ctx: Context) => {
   const now = Date.now();
   const chatState = getOrCreateChatState(chat.id, now);
 
-  // 2. Ensure bot username is known
   if (!botUsernameLower) {
-    // If this ever happens, something went wrong during startup init.
     logDebug("botUsernameLower missing, skipping update");
     return;
   }
 
-  const textLower = (text ?? "").toLowerCase();
-  const isTagged = botUsernameLower ? textLower.includes(`@${botUsernameLower}`) : false;
-  const isReplyToBot = ctx.message?.reply_to_message?.from?.id === botId;
+  const textLower = text.toLowerCase();
+  const isTagged = textLower.includes(`@${botUsernameLower}`);
+  const isReplyToBot = message.reply_to_message?.from?.id === botId;
 
   let shouldRespond = false;
   let useSpontaneousPrompt = false;
@@ -142,19 +197,15 @@ bot.on("message:text", async (ctx: Context) => {
     shouldRespond = true;
     useSpontaneousPrompt = false;
   } else {
-    // Spontaneous logic (per-chat)
     const gapMs = now - chatState.lastSeenMessageAt;
     chatState.lastSeenMessageAt = now;
     chatState.messageCounter++;
 
-    // Condition 2: First message after 4h gap in chat
     if (gapMs >= FOUR_HOURS_MS) {
       shouldRespond = true;
       useSpontaneousPrompt = true;
       logDebug("spontaneous due to 4h gap", { chatId: chat.id, gapMs });
-    }
-    // Condition 1: Every ~5th message (randomized 4-7)
-    else if (chatState.messageCounter >= chatState.nextInterjectionAt) {
+    } else if (chatState.messageCounter >= chatState.nextInterjectionAt) {
       shouldRespond = true;
       useSpontaneousPrompt = true;
       logDebug("spontaneous due to counter", {
@@ -169,56 +220,70 @@ bot.on("message:text", async (ctx: Context) => {
     return;
   }
 
-  // Reset counters if we are responding
   if (useSpontaneousPrompt) {
     chatState.messageCounter = 0;
     chatState.nextInterjectionAt = randomIntInclusive(4, 7);
   }
 
-  // Clean the prompt (remove the tag if present)
   const tagRegex = new RegExp(`@${escapeRegExp(botUsernameLower)}`, "ig");
-  const prompt = (text ?? "").replace(tagRegex, "").trim();
+  const prompt = text.replace(tagRegex, "").trim();
 
-  // If tagged but no text
-  if (isTagged && !prompt) {
+  if (isTagged && !prompt && !imageSource) {
     await ctx.reply("What the hell do you want? Tag me and say something, you donkey.", {
-      reply_parameters: { message_id: message_id },
+      reply_parameters: { message_id },
     });
     return;
   }
 
   try {
-    // Typing indicator
     await ctx.replyWithChatAction("typing");
 
-    // Context management
-    const currentMessageContent = prompt || text!;
-    chatState.history.push({ role: "user", content: currentMessageContent });
-
-    // Keep only last 3 messages in history
-    if (chatState.history.length > 3) {
-      chatState.history.shift();
+    let image: { base64: string; mime: string } | null = null;
+    if (imageSource) {
+      image = await downloadTelegramImage(imageSource.fileId, imageSource.mimeHint);
+      if (!image) {
+        throw new Error("Telegram file_path missing");
+      }
     }
+
+    const historyText = image ? [prompt, "[фото]"].filter(Boolean).join(" ") : prompt || text;
+    const previousHistory = chatState.history;
+    const userMessage: ChatCompletionMessageParam = image
+      ? {
+          role: "user",
+          content: [
+            { type: "text", text: prompt || "What's in this image?" },
+            {
+              type: "image_url",
+              image_url: { url: `data:${image.mime};base64,${image.base64}` },
+            },
+          ],
+        }
+      : { role: "user", content: historyText };
 
     const response = await openai.chat.completions.create({
       model: deepseekModel,
       messages: [
         { role: "system", content: useSpontaneousPrompt ? SPONTANEOUS_PROMPT : SYSTEM_PROMPT },
-        ...chatState.history,
+        ...previousHistory,
+        userMessage,
       ],
       temperature: useSpontaneousPrompt ? 1.0 : 0.7,
     });
 
     const reply = response.choices[0]?.message?.content || "My brain is fried, ask later.";
 
-    // Add assistant reply to history
+    chatState.history.push({ role: "user", content: historyText });
+    if (chatState.history.length > 3) {
+      chatState.history.shift();
+    }
     chatState.history.push({ role: "assistant", content: reply });
     if (chatState.history.length > 3) {
       chatState.history.shift();
     }
 
     await ctx.reply(reply, {
-      reply_parameters: { message_id: message_id },
+      reply_parameters: { message_id },
     });
   } catch (error) {
     console.error("DeepSeek API Error:", error);
