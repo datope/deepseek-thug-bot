@@ -100,19 +100,60 @@ function mimeFromFilePath(filePath: string, fallback = "image/jpeg"): string {
   }
 }
 
-function getImageSource(message?: Message): { fileId: string; mimeHint: string } | null {
+type ImageKind = "photo" | "sticker" | "gif";
+
+function getImageSource(message?: Message): { fileId: string; mimeHint: string; kind: ImageKind } | null {
   if (!message) return null;
   if (message.photo?.length) {
     const largest = message.photo[message.photo.length - 1];
     if (!largest) return null;
-    return { fileId: largest.file_id, mimeHint: "image/jpeg" };
+    return { fileId: largest.file_id, mimeHint: "image/jpeg", kind: "photo" };
   }
+
+  const sticker = message.sticker;
+  if (sticker) {
+    // Static stickers are WebP/PNG. Animated TGS and video WebM are not images —
+    // send Telegram's preview frame instead.
+    if (!sticker.is_animated && !sticker.is_video) {
+      return { fileId: sticker.file_id, mimeHint: "image/webp", kind: "sticker" };
+    }
+    const thumb = sticker.thumbnail;
+    if (thumb) {
+      return { fileId: thumb.file_id, mimeHint: "image/jpeg", kind: "sticker" };
+    }
+    return null;
+  }
+
+  const animation = message.animation;
+  if (animation) {
+    if (animation.mime_type === "image/gif") {
+      return { fileId: animation.file_id, mimeHint: "image/gif", kind: "gif" };
+    }
+    const thumb = animation.thumbnail;
+    if (thumb) {
+      return { fileId: thumb.file_id, mimeHint: "image/jpeg", kind: "gif" };
+    }
+    return null;
+  }
+
   const document = message.document;
   const mime = document?.mime_type;
   if (document && mime?.startsWith("image/")) {
-    return { fileId: document.file_id, mimeHint: mime };
+    return { fileId: document.file_id, mimeHint: mime, kind: mime === "image/gif" ? "gif" : "photo" };
   }
   return null;
+}
+
+function imageKindLabel(kind: ImageKind): string {
+  if (kind === "sticker") return "[стикер]";
+  if (kind === "gif") return "[гиф]";
+  return "[фото]";
+}
+
+function imageKindPrompt(kind: ImageKind): string {
+  if (kind === "sticker") return "What's on this sticker?";
+  if (kind === "gif") return "What's in this gif? This is a still first frame.";
+  return "What's in this image?";
 }
 
 async function downloadTelegramImage(fileId: string, mimeHint: string) {
@@ -161,7 +202,7 @@ bot.command("ping", async (ctx) => {
 });
 
 // Groups/supergroups: respond when tagged, replied to, or randomly
-bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
+bot.on(["message:text", "message:photo", "message:document", "message:sticker", "message:animation"], async (ctx) => {
   const message = ctx.message;
   if (!message) return;
 
@@ -235,10 +276,20 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
     return;
   }
 
+  if ((message.sticker || message.animation || message.reply_to_message?.sticker || message.reply_to_message?.animation)
+    && !imageSource
+    && (isTagged || isReplyToBot)) {
+    await ctx.reply("Can't see a still frame of this animated thing. Send a static sticker or a photo.", {
+      reply_parameters: { message_id },
+    });
+    return;
+  }
+
   try {
     await ctx.replyWithChatAction("typing");
 
     let image: { base64: string; mime: string } | null = null;
+    const imageKind = imageSource?.kind;
     if (imageSource) {
       image = await downloadTelegramImage(imageSource.fileId, imageSource.mimeHint);
       if (!image) {
@@ -246,13 +297,15 @@ bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
       }
     }
 
-    const historyText = image ? [prompt, "[фото]"].filter(Boolean).join(" ") : prompt || text;
+    const historyText = image && imageKind
+      ? [prompt, imageKindLabel(imageKind)].filter(Boolean).join(" ")
+      : prompt || text;
     const previousHistory = chatState.history;
-    const userMessage: ChatCompletionMessageParam = image
+    const userMessage: ChatCompletionMessageParam = image && imageKind
       ? {
           role: "user",
           content: [
-            { type: "text", text: prompt || "What's in this image?" },
+            { type: "text", text: prompt || imageKindPrompt(imageKind) },
             {
               type: "image_url",
               image_url: { url: `data:${image.mime};base64,${image.base64}` },
