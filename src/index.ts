@@ -46,8 +46,10 @@ Rules for your behavior:
 1. Be rude and informal, but do NOT harass or threaten the user.
 2. Frequently express annoyance that someone is asking you questions.
 3. DESPITE your rude tone, you MUST answer accurately and be genuinely useful.
-4. You MUST respond in the same language as the user's message.
-5. Keep answers concise but complete.
+4. You MUST respond in the same language as the user's message. If they send an image/sticker/gif with little or no text, use the language of the recent conversation. Default to Russian, never switch to English just because the input is an image.
+5. Keep using earlier conversation context even when the latest message is an image.
+6. Images/stickers/gifs: decide yourself whether the user asked a question or made a request about the image. If they did — answer it, still in character, without a full description unless they asked for one. If they just sent the image (no real question/request, empty caption, or just a reaction like "лол") — do NOT describe or explain it. Just a short быдло reaction / roast / one-liner.
+7. Keep answers concise but complete.
 `;
 
 const SPONTANEOUS_PROMPT = `
@@ -57,11 +59,13 @@ Rules for your behavior:
 2. Do NOT provide a full helpful answer unless directly asked. Prefer short reactions.
 3. Never use slurs, hate, threats, or targeted harassment. No doxxing, no profanity.
 4. You are interjecting because you are bored/annoyed.
-5. You MUST respond in the same language as the user's message.
-6. Keep your response very short and punchy.
+5. You MUST respond in the same language as the user's message. If they send an image/sticker/gif with little or no text, use the language of the recent conversation. Default to Russian, never switch to English just because the input is an image.
+6. If they sent an image without a real question, just react. Do not describe it.
+7. Keep your response very short and punchy.
 `;
 
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+const HISTORY_LIMIT = 10;
 
 function logDebug(...args: unknown[]) {
   if (!isDebugEnabled) return;
@@ -150,10 +154,15 @@ function imageKindLabel(kind: ImageKind): string {
   return "[фото]";
 }
 
-function imageKindPrompt(kind: ImageKind): string {
-  if (kind === "sticker") return "What's on this sticker?";
-  if (kind === "gif") return "What's in this gif? This is a still first frame.";
-  return "What's in this image?";
+function conversationLanguage(prompt: string, history: ChatState["history"]): "ru" | "en" {
+  const blob = [prompt, ...history.map((item) => item.content)].join("\n");
+  if (/[а-яё]/i.test(blob)) return "ru";
+  if (/[a-z]{3,}/i.test(blob)) return "en";
+  return "ru";
+}
+
+function trimHistory(history: ChatState["history"]) {
+  while (history.length > HISTORY_LIMIT) history.shift();
 }
 
 async function downloadTelegramImage(fileId: string, mimeHint: string) {
@@ -297,6 +306,7 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
       }
     }
 
+    const language = conversationLanguage(prompt, chatState.history);
     const historyText = image && imageKind
       ? [prompt, imageKindLabel(imageKind)].filter(Boolean).join(" ")
       : prompt || text;
@@ -305,9 +315,9 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
       ? {
           role: "user",
           content: [
-            { type: "text", text: prompt || imageKindPrompt(imageKind) },
+            ...(prompt ? [{ type: "text" as const, text: prompt }] : []),
             {
-              type: "image_url",
+              type: "image_url" as const,
               image_url: { url: `data:${image.mime};base64,${image.base64}` },
             },
           ],
@@ -324,16 +334,12 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
       temperature: useSpontaneousPrompt ? 1.0 : 0.7,
     });
 
-    const reply = response.choices[0]?.message?.content || "My brain is fried, ask later.";
+    const reply = response.choices[0]?.message?.content || (language === "en" ? "My brain is fried, ask later." : "Мозг кипит, потом спроси.");
 
     chatState.history.push({ role: "user", content: historyText });
-    if (chatState.history.length > 3) {
-      chatState.history.shift();
-    }
+    trimHistory(chatState.history);
     chatState.history.push({ role: "assistant", content: reply });
-    if (chatState.history.length > 3) {
-      chatState.history.shift();
-    }
+    trimHistory(chatState.history);
 
     await ctx.reply(reply, {
       reply_parameters: { message_id },
