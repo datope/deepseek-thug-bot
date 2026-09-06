@@ -47,9 +47,10 @@ Rules for your behavior:
 2. Frequently express annoyance that someone is asking you questions.
 3. DESPITE your rude tone, you MUST answer accurately and be genuinely useful.
 4. You MUST respond in the same language as the user's message. If they send an image/sticker/gif with little or no text, use the language of the recent conversation. Default to Russian, never switch to English just because the input is an image.
-5. Keep using earlier conversation context even when the latest message is an image.
-6. Images/stickers/gifs: decide yourself whether the user asked a question or made a request about the image. If they did — answer it, still in character, without a full description unless they asked for one. If they just sent the image (no real question/request, empty caption, or just a reaction like "лол") — do NOT describe or explain it. Just a short быдло reaction / roast / one-liner.
-7. Keep answers concise but complete.
+5. This is a group chat. User messages are prefixed with [Name]: — different names are different people. Address the person who just wrote; you can mention others by name if it fits.
+6. Keep using earlier conversation context even when the latest message is an image.
+7. Images/stickers/gifs: decide yourself whether the user asked a question or made a request about the image. If they did — answer it, still in character, without a full description unless they asked for one. If they just sent the image (no real question/request, empty caption, or just a reaction like "лол") — do NOT describe or explain it. Just a short быдло reaction / roast / one-liner.
+8. Keep answers concise but complete.
 `;
 
 const SPONTANEOUS_PROMPT = `
@@ -60,8 +61,9 @@ Rules for your behavior:
 3. Never use slurs, hate, threats, or targeted harassment. No doxxing, no profanity.
 4. You are interjecting because you are bored/annoyed.
 5. You MUST respond in the same language as the user's message. If they send an image/sticker/gif with little or no text, use the language of the recent conversation. Default to Russian, never switch to English just because the input is an image.
-6. If they sent an image without a real question, just react. Do not describe it.
-7. Keep your response very short and punchy.
+6. This is a group chat. User messages are prefixed with [Name]: — different names are different people.
+7. If they sent an image without a real question, just react. Do not describe it.
+8. Keep your response very short and punchy.
 `;
 
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
@@ -85,6 +87,18 @@ function randomIntInclusive(min: number, max: number) {
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function speakerName(from: Message["from"]): string {
+  if (!from) return "кто-то";
+  const full = [from.first_name, from.last_name].filter(Boolean).join(" ").trim();
+  if (full) return full;
+  if (from.username) return `@${from.username}`;
+  return `id${from.id}`;
+}
+
+function withSpeaker(from: Message["from"], body: string): string {
+  return body ? `[${speakerName(from)}]: ${body}` : `[${speakerName(from)}]:`;
 }
 
 function mimeFromFilePath(filePath: string, fallback = "image/jpeg"): string {
@@ -267,6 +281,13 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
   }
 
   if (!shouldRespond) {
+    const skippedBody = imageSource
+      ? [text, imageKindLabel(imageSource.kind)].filter(Boolean).join(" ")
+      : text;
+    if (skippedBody) {
+      chatState.history.push({ role: "user", content: withSpeaker(from, skippedBody) });
+      trimHistory(chatState.history);
+    }
     return;
   }
 
@@ -307,15 +328,16 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
     }
 
     const language = conversationLanguage(prompt, chatState.history);
-    const historyText = image && imageKind
+    const historyBody = image && imageKind
       ? [prompt, imageKindLabel(imageKind)].filter(Boolean).join(" ")
       : prompt || text;
+    const historyText = withSpeaker(from, historyBody);
     const previousHistory = chatState.history;
     const userMessage: ChatCompletionMessageParam = image && imageKind
       ? {
           role: "user",
           content: [
-            ...(prompt ? [{ type: "text" as const, text: prompt }] : []),
+            { type: "text" as const, text: withSpeaker(from, prompt) },
             {
               type: "image_url" as const,
               image_url: { url: `data:${image.mime};base64,${image.base64}` },
