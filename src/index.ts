@@ -168,6 +168,17 @@ function imageKindLabel(kind: ImageKind): string {
   return "[фото]";
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function markdownBoldToTelegramHtml(value: string): string {
+  return escapeHtml(value).replace(/\*\*([\s\S]+?)\*\*/g, "<b>$1</b>");
+}
+
 function conversationLanguage(prompt: string, history: ChatState["history"]): "ru" | "en" {
   const blob = [prompt, ...history.map((item) => item.content)].join("\n");
   if (/[а-яё]/i.test(blob)) return "ru";
@@ -363,9 +374,17 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
     chatState.history.push({ role: "assistant", content: reply });
     trimHistory(chatState.history);
 
-    await ctx.reply(reply, {
-      reply_parameters: { message_id },
-    });
+    try {
+      await ctx.reply(markdownBoldToTelegramHtml(reply), {
+        reply_parameters: { message_id },
+        parse_mode: "HTML",
+      });
+    } catch (sendError) {
+      console.error("Telegram HTML parse failed, sending plain:", sendError);
+      await ctx.reply(reply, {
+        reply_parameters: { message_id },
+      });
+    }
   } catch (error) {
     console.error("DeepSeek API Error:", error);
     if (isTagged || isReplyToBot) {
