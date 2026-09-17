@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
-import { Bot, webhookCallback } from "grammy";
+import { Bot, InputFile, webhookCallback } from "grammy";
+import type { Context } from "grammy";
 import type { Message } from "grammy/types";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
@@ -14,6 +15,9 @@ const isDebugEnabled = process.env.DEBUG === "1";
 const startupChat = process.env.STARTUP_CHAT; // e.g. "@deepseekV4_chat"
 const startupText = process.env.STARTUP_TEXT; // e.g. "привет"
 const shouldExitAfterStartupSend = process.env.STARTUP_EXIT_AFTER_SEND === "1";
+const rawGroupChatHandle = process.env.GROUP_CHAT_USERNAME || "@deepseekV4_chat";
+const groupChatHandle = rawGroupChatHandle.startsWith("@") ? rawGroupChatHandle : `@${rawGroupChatHandle}`;
+const shouldCatchUpIgnoredDms = process.env.DM_CATCHUP !== "0";
 
 function shouldUseWebhook(): boolean {
   if (process.env.USE_POLLING === "1") return false;
@@ -53,6 +57,20 @@ Rules for your behavior:
 8. Keep answers concise but complete.
 `;
 
+function dmRedirectSystemPrompt(): string {
+  return `
+Ты — злое быдло из падика.
+Человек написал тебе в ЛИЧКУ. Ты НЕ отвечаешь на его вопрос и НЕ помогаешь.
+Задача: коротко послать его писать в групповой чат ${groupChatHandle}. Скажи что в личке не общаешься.
+Rules:
+1. Говори как гопник: тыкаешь, орёшь, мат ок, но не лей каждое слово.
+2. You MUST write in the same language as the user's message. If there is almost no text, default to Russian.
+3. 1–3 коротких предложения. Не цитируй вопрос. Не отвечай по существу.
+4. Обязательно укажи ${groupChatHandle} как место куда писать.
+5. Никакого расизма, хейта, реальных угроз, доксинга.
+`.trim();
+}
+
 const SPONTANEOUS_PROMPT = `
 Ты — злое быдло, которое врывается в чат и кидает язвительные реплики. Бантер, не реальная злоба.
 Rules for your behavior:
@@ -68,6 +86,8 @@ Rules for your behavior:
 
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const HISTORY_LIMIT = 10;
+const TELEGRAM_TEXT_LIMIT = 4096;
+const TELEGRAM_SPLIT_MAX_CHUNKS = 3;
 
 function logDebug(...args: unknown[]) {
   if (!isDebugEnabled) return;
@@ -179,11 +199,190 @@ function markdownBoldToTelegramHtml(value: string): string {
   return escapeHtml(value).replace(/\*\*([\s\S]+?)\*\*/g, "<b>$1</b>");
 }
 
+function splitTelegramText(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    const slice = remaining.slice(0, limit);
+    let cut = slice.lastIndexOf("\n");
+    if (cut < limit * 0.5) cut = slice.lastIndexOf(" ");
+    if (cut < 1) cut = limit;
+    chunks.push(remaining.slice(0, cut).trimEnd());
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+async function sendBotReply(ctx: Context, text: string, replyToMessageId: number) {
+  const replyOpts = { reply_parameters: { message_id: replyToMessageId } };
+
+  const sendPlain = async (chunk: string) => {
+    await ctx.reply(chunk.slice(0, TELEGRAM_TEXT_LIMIT), replyOpts);
+  };
+
+  const sendChunk = async (chunk: string) => {
+    const html = markdownBoldToTelegramHtml(chunk);
+    if (html.length <= TELEGRAM_TEXT_LIMIT) {
+      try {
+        await ctx.reply(html, { ...replyOpts, parse_mode: "HTML" });
+        return;
+      } catch (error) {
+        console.error("Telegram HTML send failed, sending plain chunk:", error);
+      }
+    }
+    await sendPlain(chunk);
+  };
+
+  const html = markdownBoldToTelegramHtml(text);
+  if (html.length <= TELEGRAM_TEXT_LIMIT) {
+    try {
+      await ctx.reply(html, { ...replyOpts, parse_mode: "HTML" });
+      return;
+    } catch (error) {
+      console.error("Telegram HTML send failed, retrying without parse_mode:", error);
+      if (text.length <= TELEGRAM_TEXT_LIMIT) {
+        await sendPlain(text);
+        return;
+      }
+    }
+  }
+
+  const sendAsFile = async () => {
+    await ctx.replyWithDocument(new InputFile(Buffer.from(text, "utf8"), "reply.txt"), {
+      caption: "Слишком длинно, на файл.",
+      ...replyOpts,
+    });
+  };
+
+  const chunks = splitTelegramText(text);
+  if (chunks.length > TELEGRAM_SPLIT_MAX_CHUNKS) {
+    await sendAsFile();
+    return;
+  }
+
+  try {
+    for (const chunk of chunks) {
+      await sendChunk(chunk);
+    }
+  } catch (error) {
+    console.error("Telegram chunk send failed, sending as file:", error);
+    await sendAsFile();
+  }
+}
+
 function conversationLanguage(prompt: string, history: ChatState["history"]): "ru" | "en" {
   const blob = [prompt, ...history.map((item) => item.content)].join("\n");
   if (/[а-яё]/i.test(blob)) return "ru";
   if (/[a-z]{3,}/i.test(blob)) return "en";
   return "ru";
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function fallbackDmRedirect(userText: string): string {
+  if (/[а-яё]/i.test(userText) || !userText.trim()) {
+    return `эй ты епта пиши мне здесь — ${groupChatHandle}\nтут я не общаюсь`;
+  }
+  if (/[ñáéíóúü¿¡]/i.test(userText) || /\b(el|la|que|hola|gracias|por|qué|cómo|está|una|para)\b/i.test(userText)) {
+    return `eh tío escríbeme aquí — ${groupChatHandle}\naquí no hablo`;
+  }
+  return `yo dumbass write to me here — ${groupChatHandle}\ni don't talk here`;
+}
+
+async function generateDmRedirectReply(userText: string): Promise<string> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: deepseekModel,
+      messages: [
+        { role: "system", content: dmRedirectSystemPrompt() },
+        { role: "user", content: userText.trim() || "[empty]" },
+      ],
+      temperature: 0.8,
+      max_tokens: 220,
+    });
+    const reply = response.choices[0]?.message?.content?.trim();
+    if (reply) return reply;
+  } catch (error) {
+    console.error("DM redirect generation failed:", error);
+  }
+  return fallbackDmRedirect(userText);
+}
+
+async function sendDmRedirect(chatId: number, userText: string, replyToMessageId?: number) {
+  const text = await generateDmRedirectReply(userText);
+  try {
+    await bot.api.sendMessage(
+      chatId,
+      text,
+      replyToMessageId ? { reply_parameters: { message_id: replyToMessageId } } : undefined,
+    );
+  } catch (error) {
+    console.error("DM redirect send failed, retrying without reply:", error);
+    await bot.api.sendMessage(chatId, text);
+  }
+}
+
+function latestPrivateMessageByChat(messages: Message[]): Map<number, Message> {
+  const latest = new Map<number, Message>();
+  for (const message of messages) {
+    if (message.chat.type !== "private") continue;
+    if (message.from?.is_bot) continue;
+    const prev = latest.get(message.chat.id);
+    if (!prev || message.message_id >= prev.message_id) {
+      latest.set(message.chat.id, message);
+    }
+  }
+  return latest;
+}
+
+async function drainPendingUpdates(): Promise<Message[]> {
+  await bot.api.deleteWebhook({ drop_pending_updates: false });
+  const privateMessages: Message[] = [];
+  let offset: number | undefined;
+  for (let i = 0; i < 100; i++) {
+    const batch = await bot.api.getUpdates({
+      ...(offset !== undefined ? { offset } : {}),
+      limit: 100,
+      timeout: 0,
+    });
+    if (batch.length === 0) break;
+    for (const update of batch) {
+      offset = update.update_id + 1;
+      if (update.message?.chat.type === "private") {
+        privateMessages.push(update.message);
+      }
+    }
+  }
+  if (offset !== undefined) {
+    await bot.api.getUpdates({ offset, limit: 1, timeout: 0 });
+  }
+  return privateMessages;
+}
+
+async function catchUpIgnoredPrivateMessages() {
+  if (!shouldCatchUpIgnoredDms) {
+    console.log("DM catch-up skipped (DM_CATCHUP=0)");
+    return;
+  }
+
+  console.log("Catching up ignored DMs from pending Telegram updates...");
+  const pendingPrivate = await drainPendingUpdates();
+  const latestByChat = latestPrivateMessageByChat(pendingPrivate);
+  let sent = 0;
+  for (const message of latestByChat.values()) {
+    const userText = message.text ?? message.caption ?? "";
+    try {
+      await sendDmRedirect(message.chat.id, userText, message.message_id);
+      sent++;
+      await sleep(80);
+    } catch (error) {
+      console.error("DM catch-up failed for chat", message.chat.id, error);
+    }
+  }
+  console.log(`DM catch-up done: replied to ${sent} ignored private chat(s), discarded pending group updates`);
 }
 
 function trimHistory(history: ChatState["history"]) {
@@ -246,12 +445,17 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
   const repliedImage = getImageSource(message.reply_to_message);
   const imageSource = ownImage ?? repliedImage;
 
-  if (message.document && !ownImage) return;
-
   if (chat.type === "private") {
-    console.log("Ignoring message in DM from", from?.first_name);
+    try {
+      await ctx.replyWithChatAction("typing");
+      await sendDmRedirect(chat.id, text, message_id);
+    } catch (error) {
+      console.error("DM redirect failed:", error);
+    }
     return;
   }
+
+  if (message.document && !ownImage) return;
 
   const now = Date.now();
   const chatState = getOrCreateChatState(chat.id, now);
@@ -375,20 +579,21 @@ bot.on(["message:text", "message:photo", "message:document", "message:sticker", 
     trimHistory(chatState.history);
 
     try {
-      await ctx.reply(markdownBoldToTelegramHtml(reply), {
-        reply_parameters: { message_id },
-        parse_mode: "HTML",
-      });
+      await sendBotReply(ctx, reply, message_id);
     } catch (sendError) {
-      console.error("Telegram HTML parse failed, sending plain:", sendError);
-      await ctx.reply(reply, {
-        reply_parameters: { message_id },
-      });
+      console.error("Telegram send failed:", sendError);
+      if (isTagged || isReplyToBot) {
+        await ctx.reply("System error, idiot. Try again later.", {
+          reply_parameters: { message_id },
+        });
+      }
     }
   } catch (error) {
     console.error("DeepSeek API Error:", error);
     if (isTagged || isReplyToBot) {
-      await ctx.reply("System error, idiot. Try again later.");
+      await ctx.reply("System error, idiot. Try again later.", {
+        reply_parameters: { message_id },
+      });
     }
   }
 });
@@ -419,6 +624,10 @@ async function start() {
     if (shouldExitAfterStartupSend) return;
   }
 
+  await catchUpIgnoredPrivateMessages().catch((error) => {
+    console.error("DM catch-up failed, continuing startup:", error);
+  });
+
   const useWebhook = shouldUseWebhook();
   const baseUrl = getWebhookBaseUrl();
   const webhookPath = process.env.WEBHOOK_PATH ?? "/telegram/webhook";
@@ -430,9 +639,8 @@ async function start() {
       throw new Error("Webhook mode needs WEBHOOK_BASE_URL or RAILWAY_PUBLIC_DOMAIN");
     }
     const webhookUrl = `${baseUrl}${webhookPath}`;
-    await bot.api.deleteWebhook({ drop_pending_updates: true });
     await bot.api.setWebhook(webhookUrl, {
-      drop_pending_updates: true,
+      drop_pending_updates: false,
       ...(webhookSecret ? { secret_token: webhookSecret } : {}),
     });
     console.log(`Webhook mode: ${webhookUrl}`);
@@ -463,7 +671,7 @@ async function start() {
   }
 
   if (process.env.DELETE_WEBHOOK_BEFORE_POLLING === "1") {
-    await bot.api.deleteWebhook({ drop_pending_updates: true });
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
     console.log("deleteWebhook: cleared (DELETE_WEBHOOK_BEFORE_POLLING=1)");
   }
   console.log("Long polling (getUpdates). If you see 409, another process is also polling this token.");
